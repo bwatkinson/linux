@@ -34,6 +34,13 @@
 #include <linux/backing-dev.h>
 #include <linux/mman.h>
 
+/*
+ * Brian A. Added this line
+ */
+/*************************************/
+#include <linux/xfs_timestamp.h>
+/*************************************/
+
 static const struct vm_operations_struct xfs_file_vm_ops;
 
 int
@@ -261,6 +268,13 @@ xfs_file_read_iter(
 
 	if (XFS_FORCED_SHUTDOWN(mp))
 		return -EIO;
+
+    /* 
+     * Brian A. Added this line 
+     */
+    /**********************************************/
+    xfs_add_timestamp(task_pid_nr(current), 0, __func__);
+    /**********************************************/
 
 	if (IS_DAX(inode))
 		ret = xfs_file_dax_read(iocb, to);

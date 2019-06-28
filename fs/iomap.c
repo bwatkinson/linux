@@ -33,6 +33,11 @@
 #include "internal.h"
 
 /*
+ * Brian A. Added this line
+ */
+#include <linux/xfs_timestamp.h>
+
+/*
  * Execute a iomap write on a segment of the mapping that spans a
  * contiguous range of pages that have identical block mapping state.
  *
@@ -1081,6 +1086,15 @@ iomap_dio_actor(struct inode *inode, loff_t pos, loff_t length,
 		atomic_inc(&dio->ref);
 
 		dio->submit.last_queue = bdev_get_queue(iomap->bdev);
+        /*
+         * Brian A. Added this line
+         */
+        /************************************************/
+        if (iov_iter_rw(dio->submit.iter) == READ)
+        {
+            xfs_add_timestamp(task_pid_nr(current), 1, __func__);
+        }
+        /************************************************/
 		dio->submit.cookie = submit_bio(bio);
 	} while (nr_pages);
 
@@ -1235,9 +1249,19 @@ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
 			if (!(iocb->ki_flags & IOCB_HIPRI) ||
 			    !dio->submit.last_queue ||
 			    !blk_poll(dio->submit.last_queue,
-					 dio->submit.cookie))
-				io_schedule();
-		}
+					 dio->submit.cookie)) {
+                /*
+                 * Brian A. Added this line
+                 */
+                /**************************************/
+                if (iov_iter_rw(iter) == READ)
+                {
+                    xfs_add_timestamp(task_pid_nr(current), 2, __func__);
+                }
+                /**************************************/
+                io_schedule();
+		    }
+        }
 		__set_current_state(TASK_RUNNING);
 	}
 
@@ -1250,6 +1274,239 @@ out_free_dio:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(iomap_dio_rw);
+
+/*
+ * Brian A. Added this line
+ */
+/********************************/
+/*
+ * In general, the following values should be changed in order to add an
+ * additional call for xfs_add_timestamp function from any other source
+ * file locations:
+ * NUM_LOG_FILES        : Total number of call sites for xfs_add_timestamp
+ * LOG_FILE_ARR         : Paths to log files (there must be a mathicng number
+ *                        of these for the NUM_LOG_FILES value)
+ * DEFINE_MUTEX(mutex#) : There must be a matching number of these for the
+ *                        NUM_LOG_FILES value 
+ * LOCK_LOCAL_MUTEX     : Must add/remove any additional cases to the switch
+ *                        statement to match NUM_LOG_FILES value
+ * UNLOCK_LOCAL_MUTEX   : Must add/remove any additional cases to the switch
+ *                        statement to match NUM_LOG_FILES value
+ * 
+ * Each call to xfs_add_timestamp will be indexed in using the offset value
+ * passed. So each call site should pass a unique value from 0 to (NUM_LOG_FILES - 1).
+ * The offset passed to xfs_add_timestamp corresponds to the log file name
+ * in LOG_FILE_ARR.
+ */
+
+/*
+ * This defines the total number of call sites this function will
+ * be called from
+ */
+#define NUM_LOG_FILES 3
+
+/*
+ * Change these variables in order to set the default location for
+ * the time stamps collected
+ */
+const static char *LOG_FILE_ARR[NUM_LOG_FILES] = {"/var/log/xfs_file_read_iter0.log",
+                                                  "/var/log/xfs_submit_bio1.log",
+                                                  "/var/log/xfs_io_scheudle2.log"};
+
+/*
+ * Local synchronization variables/functions
+ */
+DEFINE_MUTEX(mutex0);
+DEFINE_MUTEX(mutex1);
+DEFINE_MUTEX(mutex2);
+
+#define LOCK_LOCAL_MUTEX(offset) \
+do {                             \
+    switch(offset) {             \
+        case 0:                  \
+            mutex_lock(&mutex0); \
+            break;               \
+        case 1:                  \
+            mutex_lock(&mutex1); \
+            break;               \
+        case 2:                  \
+            mutex_lock(&mutex2); \
+            break;               \
+    }                            \
+} while(0)                       \
+
+#define UNLOCK_LOCAL_MUTEX(offset) \
+do {                               \
+    switch(offset) {               \
+        case 0:                    \
+            mutex_unlock(&mutex0); \
+            break;                 \
+        case 1:                    \
+            mutex_unlock(&mutex1); \
+            break;                 \
+        case 2:                    \
+            mutex_unlock(&mutex2); \
+            break;                 \
+    }                              \
+} while(0)                         \
+
+/*
+ * Static function definitions
+ */
+static inline struct file *
+xfs_filp_open(const char *name, int flags, int mode, int *err)
+{
+    struct file *filp = NULL;
+    int rc = 0;
+
+    filp = filp_open(name, flags, mode);
+    if (IS_ERR(filp)) {
+        rc = PTR_ERR(filp);
+        if (err) {
+            *err = rc;
+        }
+        filp = NULL;
+    }
+    return filp;
+}
+
+static inline ssize_t
+xfs_kernel_write(struct file *file, const void *buf, size_t count, loff_t *pos)
+{
+    return (kernel_write(file, buf, count, pos));
+}
+
+static inline longlong_t
+getxfstime(void)
+{
+    struct timespec ts;
+    getrawmonotonic(&ts);
+    return (((longlong_t)ts.tv_sec * NSEC_PER_SEC) + ts.tv_nsec);
+}
+
+/*
+ * Initializing all array values
+ */
+static ts_array_t the_arrays[NUM_LOG_FILES] = {0};
+
+/*
+ * Function Definition
+ */
+/**
+ * xfs_add_timestamp - Adds time stamp to the array at offset up to
+ * STATIC_LIST_CAP and automatically dumps the time stamps to LOG_FILE_ARR[offset]
+ * once STATIC_LIST_CAP time stamps have been collected.
+ * @curr_pid       : Process ID that is calling this function
+ * @offset         : Unique number from 0 to NUM_LOG_FILES - 1 for the call site
+ * @call_site_name : Name of the function calling this (use __func__)
+ *
+ * Ideally this should be used with threads where no locking should occur;
+ * however, a race condition does exist when adding times to the arrays. At
+ * no point can this liseet be reset and it will only dump the time stamps once
+ * to the LOG_FILE_ARR[offset].
+ */
+void xfs_add_timestamp(int curr_pid, unsigned int offset, const char *call_site_name)
+{
+    int pid_row = 0;
+    int call_site_name_len = 0;
+    int i = 0;
+
+    /* Making sure a valid offset was passed */
+    if (offset > (NUM_LOG_FILES - 1)) {
+        printk(KERN_CRIT "Invalid offset passed to xfs_add_timestamp %d > %d",
+            offset, NUM_LOG_FILES - 1);
+        return;
+    }
+
+    if (!(the_arrays[offset].dumped)) {
+        /* First find the raw of the curr_pid */
+        pid_row = curr_pid % STATIC_PID_CAP;
+
+        /*
+         * If another PID resides in the slot find next avialable slot. If no
+         * slot is available just bail
+         */
+        while ((the_arrays[offset].array[pid_row][0] != curr_pid) &&
+               (the_arrays[offset].row_select_iter < STATIC_PID_CAP)) {
+            if (the_arrays[offset].array[pid_row][0] != 0) {
+                the_arrays[offset].row_select_iter += 1;
+                pid_row += 1;
+            } else {
+                break;
+            }
+        }
+
+        /* Bailing here if no available slot */
+        if (the_arrays[offset].row_select_iter == STATIC_PID_CAP)
+            return;
+
+        the_arrays[offset].array_size += 1;
+        the_arrays[offset].array[pid_row][0] = curr_pid;
+        the_arrays[offset].array[pid_row][the_arrays[offset].array[pid_row][1] + 1] =
+            NSEC2USEC(getxfstime());
+        the_arrays[offset].array[pid_row][1] += 1;
+        if (the_arrays[offset].array_size >= STATIC_PID_CAP) {
+            /* Only a single thread will write the log file */
+            LOCK_LOCAL_MUTEX(offset);
+
+            if (!the_arrays[offset].dumped) {
+                the_arrays[offset].dump_file =
+                    xfs_filp_open(LOG_FILE_ARR[offset], O_WRONLY|O_CREAT, 0666, NULL);
+                if (the_arrays[offset].dump_file == NULL) {
+                    printk(KERN_CRIT "Could not open the_array[%d].dump_file = %s",
+                       offset, LOG_FILE_ARR[offset]);
+                    UNLOCK_LOCAL_MUTEX(offset);
+                    return;
+                }
+                the_arrays[offset].dumped = 1;
+            } else {
+                UNLOCK_LOCAL_MUTEX(offset);
+                return;
+            }
+
+            /* First writing out the total number of PID's with timestamps to the file */
+            for (i = 0; i < STATIC_PID_CAP; i++) {
+                if (the_arrays[offset].array[i][0] != 0)
+                    the_arrays[offset].total_pids += 1;
+            }
+            xfs_kernel_write(the_arrays[offset].dump_file,
+                             &the_arrays[offset].total_pids,
+                             sizeof(longlong_t),
+                             &the_arrays[offset].file_offset);
+
+            /*
+             * Next writing out the name of the call site by first writing out the length
+             * of the call site name and then the actual call site
+             */
+            call_site_name_len = strlen(call_site_name);
+            /* Length of call site name */
+            xfs_kernel_write(the_arrays[offset].dump_file,
+                             &call_site_name_len,
+                             sizeof(int),
+                             &the_arrays[offset].file_offset);
+
+            /* Call site name */
+            xfs_kernel_write(the_arrays[offset].dump_file,
+                             call_site_name,
+                             sizeof(char) * call_site_name_len,
+                             &the_arrays[offset].file_offset);
+
+            /* Now writing out each PID with it corresponding time stamps */
+            for (i = 0; i < STATIC_PID_CAP; i++) {
+                if (the_arrays[offset].array[i][0] != 0) {
+                    xfs_kernel_write(the_arrays[offset].dump_file,
+                                     &the_arrays[offset].array[i],
+                                     sizeof(longlong_t) * (the_arrays[offset].array[i][1] + 2),
+                                     &the_arrays[offset].file_offset);
+                }
+            }
+            xfs_filp_close(the_arrays[offset].dump_file);
+            UNLOCK_LOCAL_MUTEX(offset);
+       }
+    }
+}
+EXPORT_SYMBOL_GPL(xfs_add_timestamp);
+/********************************/
 
 /* Swapfile activation */
 
